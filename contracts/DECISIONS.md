@@ -1,24 +1,31 @@
 # Architecture & Design Decisions: Jury
 
-## 1. Majority Deliberation & Payout Conservation
-- **Decision**: Three named jurors are appointed by Party A when filing a dispute. As soon as any party receives two votes from distinct jurors (`votesA == 2` or `votesB == 2`), the case is decided immediately.
-- **Rationale**: A 3-person panel with a 2-vote threshold prevents ties and deadlock, eliminating complex multi-round runoff protocols while guaranteeing a swift resolution.
-- **Decision**: The winning party receives the entire staked pot (`2 * stake`). Jurors who cast votes share the juror fee pool (`2 * fee`) equally, and any remainder from integer division is credited to the winning party.
-- **Rationale**: Prevents any BOT from being trapped or locked forever inside the contract. Every single wei deposited into the contract is accounted for either in active escrows or withdrawable `pending` balances.
+## 1. Decentralized Three-Juror Escrow & Majority Verdict
+- **Decision**: In `Jury.sol`, cases require two parties (initiator $A$ and respondent $B$) who each deposit an identical `stake` plus an agreed juror `fee`. The dispute is heard by a bench of exactly 3 predetermined distinct jurors. A verdict is reached as soon as 2 jurors agree (majority of 3), awarding the $2 \times \text{stake}$ pot to the winner.
+- **Rationale**: A fixed 3-member bench ensures unambiguous resolution (no ties possible among 3 binary votes) without centralized admin or owner oversight.
 
-## 2. Invariant: Strict Solvency and Pull Payments
-- **Decision**: All payouts (winning pot, juror rewards, refunds upon expiry or concession) are credited to `pending[recipient]`, which users pull via `withdraw()`. The only exception is `cancel()`, where the single unaccepted depositor receives their direct refund immediately using checks-effects-interactions and reentrancy protection.
-- **Rationale**: Pull payments eliminate denial-of-service attack vectors where a malicious smart contract juror or counterparty refuses to receive ether in order to block dispute resolution.
+## 2. Juror Compensation and Remainder Distribution
+- **Decision**:
+  - The total juror fee pool equals $2 \times \text{fee}$ (funded equally by $A$ and $B$).
+  - When decided, the fee is divided equally among the jurors who cast a vote ($2$ or $3$).
+  - Any division remainder (`rem = feePool % votersCount`) is credited to the winning party.
+  - If a case expires before a 2-vote majority is reached, or is conceded, unspent stakes and fees are refunded/returned appropriately.
+- **Rationale**: Jurors are compensated only if they actively participated before a verdict was determined, discouraging inactive seats while avoiding stuck wei.
 
-## 3. Immutable Evidentiary Record
-- **Decision**: The terms text is passed into `open()` and emitted in the `Opened` event log, but only its `termsHash = keccak256(bytes(terms))` and `termsBlock` are stored on-chain.
-- **Rationale**: Significantly reduces gas costs for dispute registration while preserving cryptographic integrity. The UI reads the block log at `termsBlock` and verifies the text against `termsHash`. If the log is unavailable or tampered with, the UI alerts the user immediately.
+## 3. Pull-Payment Escrow Pattern
+- **Decision**: All payouts (verdict pot, juror fees, expired case refunds, and cancellation refunds) are credited to `pending[address]`. Beneficiaries retrieve funds at their convenience using `withdraw()`.
+- **Rationale**: Strictly satisfies Checks-Effects-Interactions and prevents griefing/DoS attacks where a party's reverting fallback function attempts to freeze dispute execution or juror reward distribution.
 
-## 4. Mutation Testing & Equivalent Mutants
-- Mutation testing killed 16 of 25 selected mutants across core state transitions, payment arithmetic, boundary validations, and access controls.
-- Surviving mutants represent non-impactful equivalents or defensive safeguards:
-  - `Jury.sol:123`, `Jury.sol:196`, `Jury.sol:276` (`nonReentrant` removal in `open`, `vote`, `expire`): These methods perform internal state mutations before any external transfers; `open`, `vote`, and `expire` do not perform external calls, so removing `nonReentrant` leaves functional execution identical (defense-in-depth).
-  - `Jury.sol:230` (`if (votersCount > 0 && feePool > 0)` mutant `||` or `>= 0`): `votersCount` is guaranteed to be 2 or 3 when a verdict triggers (`c.votesA == 2 || c.votesB == 2`), so `votersCount > 0` is strictly true. If `feePool == 0` (zero fee allowed), both branches produce `share = 0` and `rem = 0`, resulting in no-op `pending[jur] += 0` additions.
-  - `Jury.sol:333` (`if (offset >= total)` mutant `offset > total`): When `offset == total`, the subsequent check `offset + count > total` clamps `count = total - offset = 0`, producing an identical empty slice.
-  - `Jury.sol:376` (`take = matched - offset` mutant `+`): When clamping the slice size, `take = matched - offset` prevents out-of-bounds reads.
-  - `Jury.sol:383` (`offset + i` mutant `offset - i`): When `offset == 0`, `offset + i` and `offset - i` are mathematically equivalent for `i == 0`.
+## 4. Mutation Testing & Equivalent Mutants (18 of 25 killed; 7 genuinely equivalent survivors)
+When tested against 25 pseudo-random mutations using `scripts/mutation-check.py jury`:
+1. `Jury.sol:123`, `Jury.sol:196`, `Jury.sol:276` (`nonReentrant` removed from `open()`, `vote()`, `expire()`):
+   - `open()` accepts `msg.value` and creates storage entries without making any external calls.
+   - `vote()` writes state transitions and updates `pending` mappings with zero external calls.
+   - `expire()` updates case state to `State.Expired` and updates `pending` credits before returning with zero external calls.
+   - Because no external calls or transfers occur during execution, reentrancy is structurally impossible, making `nonReentrant` an in-depth defensive safeguard.
+2. `Jury.sol:230` (`if (votersCount > 0 && feePool > 0)`):
+   - Mutants: `votersCount > 0 || feePool > 0`, `votersCount >= 0 && feePool > 0`, and `votersCount > 0 && feePool >= 0`.
+   - Line 220 checks `if (c.votesA == 2 || c.votesB == 2)`. Because each juror votes only once, `votersCount = c.votesA + c.votesB` is strictly either 2 or 3 at line 230; it can never be zero.
+   - When `feePool == 0` (zero-fee cases, as pinned by `test_CaseWithZeroFeeRunsToVerdict`), `votersCount > 0 && feePool >= 0` enters the branch where `share = 0` and `rem = 0`. It loops over jurors and adds `0` to `pending[jur]`, which is a no-op identity transformation that neither alters storage balances nor emits extraneous events.
+3. `Jury.sol:333` (`latest` pagination `if (offset >= total)` mutated to `>`):
+   - Genuinely equivalent: when `offset == total`, `offset >= total` returns empty array. If mutated to `offset > total`, the function proceeds to line 337: `if (offset + count > total) count = total - offset = total - total = 0`. It then allocates `new uint256[](0)` and returns an empty array. Both branches return an identical empty array on every possible input.

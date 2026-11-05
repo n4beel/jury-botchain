@@ -506,4 +506,91 @@ contract JuryTest is Test {
     assertEq(pList.length, 1);
     assertEq(pIds[0], 1);
   }
+
+  // --- Feedback Round 1 Pinning Tests ---
+
+  function test_CaseWithZeroFeeRunsToVerdict() public {
+    // Open case with fee = 0
+    vm.prank(partyA);
+    uint256 cid = jury.open{value: STAKE}(partyB, _defaultJurors(), TERMS, STAKE, 0, DECIDE_SECS);
+
+    vm.prank(partyB);
+    jury.accept{value: STAKE}(cid);
+
+    uint256 jur1Before = jury.pending(juror1);
+    uint256 jur2Before = jury.pending(juror2);
+    uint256 winnerBefore = jury.pending(partyA);
+
+    // Juror 1 and Juror 2 vote A
+    vm.prank(juror1);
+    jury.vote(cid, true);
+    vm.prank(juror2);
+    jury.vote(cid, true); // 2 votes reached -> Decided
+
+    Jury.Case memory c = jury.caseOf(cid);
+    assertEq(uint8(c.state), uint8(Jury.State.Decided));
+
+    // Winner gets exactly 2 * STAKE pot, 0 extra fee
+    assertEq(jury.pending(partyA), winnerBefore + 2 * STAKE);
+    // Jurors get 0 extra
+    assertEq(jury.pending(juror1), jur1Before);
+    assertEq(jury.pending(juror2), jur2Before);
+  }
+
+  function test_PagingWithFilterExactIdsInOrder() public {
+    address partyC = makeAddr("partyC");
+    vm.deal(partyC, 100 ether);
+
+    // Create 5 cases:
+    // Case 1: partyA vs partyB
+    // Case 2: partyA vs partyC
+    // Case 3: partyB vs partyC
+    // Case 4: partyA vs partyB
+    // Case 5: partyA vs partyC
+    vm.prank(partyA);
+    jury.open{value: STAKE + FEE}(partyB, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS); // id 1
+    vm.prank(partyA);
+    jury.open{value: STAKE + FEE}(partyC, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS); // id 2
+    vm.prank(partyB);
+    jury.open{value: STAKE + FEE}(partyC, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS); // id 3
+    vm.prank(partyA);
+    jury.open{value: STAKE + FEE}(partyB, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS); // id 4
+    vm.prank(partyA);
+    jury.open{value: STAKE + FEE}(partyC, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS); // id 5
+
+    // partyA matches: [5, 4, 2, 1] (newest first, total 4 matches)
+    // Page with offset = 1, count = 2 -> expected [4, 2]
+    (uint256[] memory idsPartyA1, ) = jury.byParty(partyA, 1, 2);
+    assertEq(idsPartyA1.length, 2);
+    assertEq(idsPartyA1[0], 4);
+    assertEq(idsPartyA1[1], 2);
+
+    // Page with offset = 2, count = 3 -> expected [2, 1] (clamped to 2)
+    (uint256[] memory idsPartyA2, ) = jury.byParty(partyA, 2, 3);
+    assertEq(idsPartyA2.length, 2);
+    assertEq(idsPartyA2[0], 2);
+    assertEq(idsPartyA2[1], 1);
+
+    // partyC matches: [5, 3, 2] (total 3 matches)
+    // Page with offset = 1, count = 2 -> expected [3, 2]
+    (uint256[] memory idsPartyC1, ) = jury.byParty(partyC, 1, 2);
+    assertEq(idsPartyC1.length, 2);
+    assertEq(idsPartyC1[0], 3);
+    assertEq(idsPartyC1[1], 2);
+  }
+
+  function test_OffsetEqualsTotalReturnsEmpty() public {
+    // Ensure there is at least one case
+    vm.prank(partyA);
+    jury.open{value: STAKE + FEE}(partyB, _defaultJurors(), TERMS, STAKE, FEE, DECIDE_SECS);
+
+    // When offset == total, latest MUST return empty array (0 length)
+    uint256 total = jury.caseCount();
+    (uint256[] memory emptyLatest, Jury.Case[] memory emptyList) = jury.latest(total, 5);
+    assertEq(emptyLatest.length, 0);
+    assertEq(emptyList.length, 0);
+
+    // If offset > total was used (mutant >= to >), offset == total would attempt to read total - (offset + 0) = 0!
+    // Since total = 1, case 0 does not exist and would return zeroed data with length > 0 instead of 0 length.
+  }
 }
