@@ -477,6 +477,15 @@ contract JuryTest is Test {
     vm.prank(partyA);
     jury.open{value: 100_000 ether + FEE}(partyB, _defaultJurors(), TERMS, 100_000 ether, FEE, DECIDE_SECS);
 
+    // Exact 1000 ether max fee
+    vm.prank(partyA);
+    jury.open{value: STAKE + 1000 ether}(partyB, _defaultJurors(), TERMS, STAKE, 1000 ether, DECIDE_SECS);
+
+    // Fee > 1000 ether reverts
+    vm.prank(partyA);
+    vm.expectRevert(Jury.BadParams.selector);
+    jury.open{value: STAKE + 1001 ether}(partyB, _defaultJurors(), TERMS, STAKE, 1001 ether, DECIDE_SECS);
+
     // Above max stake reverts
     vm.prank(partyA);
     vm.expectRevert(Jury.BadParams.selector);
@@ -487,7 +496,14 @@ contract JuryTest is Test {
     assertGt(ids.length, 0);
     assertEq(list.length, ids.length);
 
-    (uint256[] memory pIds, ) = jury.byParty(partyA, 0, 10);
-    assertGt(pIds.length, 0);
+    // Offset equal to total returns empty
+    (uint256[] memory emptyIds, ) = jury.latest(jury.caseCount(), 10);
+    assertEq(emptyIds.length, 0);
+
+    // byParty with offset > 0
+    (uint256[] memory pIds, Jury.Case[] memory pList) = jury.byParty(partyA, 1, 1);
+    assertEq(pIds.length, 1);
+    assertEq(pList.length, 1);
+    assertEq(pIds[0], 1);
   }
 }
