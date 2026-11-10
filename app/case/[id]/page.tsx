@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useEffect, useRef, useState, use } from "react";
 import Link from "next/link";
 import { useAccount, useWalletClient, usePublicClient } from "wagmi";
 import { formatEther, parseAbiItem } from "viem";
@@ -59,6 +59,7 @@ export default function CaseDetailPage({
   const [details, setDetails] = useState<CaseDetails | null>(null);
   const [loading, setLoading] = useState(true);
   const [isTransacting, setIsTransacting] = useState(false);
+  const isTransactingRef = useRef(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [txSuccessMsg, setTxSuccessMsg] = useState<string | null>(null);
   const [currentTimeSec, setCurrentTimeSec] = useState<bigint>(
@@ -73,14 +74,16 @@ export default function CaseDetailPage({
     return () => clearInterval(timer);
   }, []);
 
-  async function loadCaseData() {
+  // Returns a signature of the state it read, so callers can tell whether the chain has
+  // caught up with a transaction that was just confirmed (RPC nodes can lag a block or two).
+  async function loadCaseData(silent = false): Promise<string | null> {
     if (!publicClient || !isDeployed) {
       setLoading(false);
-      return;
+      return null;
     }
 
     try {
-      setErrorMsg(null);
+      if (!silent) setErrorMsg(null);
       const [cData, jurorAddrs] = await Promise.all([
         publicClient.readContract({
           address: contractAddress,
@@ -151,12 +154,25 @@ export default function CaseDetailPage({
         termsTextFound: found,
       });
       setLoading(false);
+      return `${cData.state}:${cData.votesA}:${cData.votesB}:${votes.map((v) => Number(v)).join(",")}`;
     } catch (err: any) {
       console.error("Failed to load case detail:", err);
-      setErrorMsg(formatJuryError(err));
+      if (!silent) setErrorMsg(formatJuryError(err));
       setLoading(false);
+      return null;
     }
   }
+
+  // Keep the page current without a manual refresh: the other party or a juror may act
+  // while this page is open. The ref always holds the latest render's loader.
+  const loadRef = useRef(loadCaseData);
+  loadRef.current = loadCaseData;
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (!isTransactingRef.current) void loadRef.current(true);
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [contractAddress, caseId]);
 
   useEffect(() => {
     loadCaseData();
@@ -268,6 +284,7 @@ export default function CaseDetailPage({
     setErrorMsg(null);
     setTxSuccessMsg(null);
     setIsTransacting(true);
+    isTransactingRef.current = true;
 
     try {
       await assertActiveChain(walletClient);
@@ -285,11 +302,20 @@ export default function CaseDetailPage({
       }
 
       setTxSuccessMsg(successText || "Transaction succeeded!");
-      await loadCaseData();
+      // Re-read until the state differs from what the screen showed before the transaction.
+      const before = details
+        ? `${details.state}:${details.votesA}:${details.votesB}:${details.jurorVotes.join(",")}`
+        : null;
+      for (let i = 0; i < 10; i++) {
+        const now = await loadCaseData(true);
+        if (now !== null && now !== before) break;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
     } catch (err: any) {
       console.error(`Error during ${fnName}:`, err);
       setErrorMsg(formatJuryError(err));
     } finally {
+      isTransactingRef.current = false;
       setIsTransacting(false);
     }
   }
@@ -335,7 +361,7 @@ export default function CaseDetailPage({
             The on-chain terms hash is <code>{details.termsHash}</code>. You can retry reading:
             <button
               type="button"
-              onClick={loadCaseData}
+              onClick={() => void loadCaseData()}
               className="ml-2 font-bold underline text-[var(--accent)] cursor-pointer"
             >
               Retry fetch
